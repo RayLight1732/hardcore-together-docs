@@ -346,200 +346,39 @@ class FileRecordRepository(private val dir: Path) : RecordRepository
 
 ### 問題
 
-`ArchiveGatewayImpl.archive()`は`TcpGateConnection.sendArchiveRequestAndAwait()`を介して`archive-complete`/`archive-rejected`（`requestId`相関、`protocol-mod-manager.md` 3.3〜3.5節）を受信するまで同期的にブロックする。この呼び出しは2箇所から行われ、**どちらもサーバーのメインスレッド上**で発生する：
-
-- `CommandRegistrar.kt`の`/archive`（Brigadierコマンドディスパッチ＝メインスレッド）
-- `DeathCountdown.kt`の`handleBossKill()`（`LivingDeathEvent`ハンドラ＝メインスレッド）
-
-ブロック中はTPSが停止し他コマンドも処理されない実害が`/archive`側で実機で見つかっている（`specification.md` 3.2節「`archive-rejected`の追加経緯」）。`handleBossKill()`側は現状同種のバグ報告は無いが、`ArchiveGateway.archive()`という同じブロッキング呼び出しを経由している以上、構造的には同じ問題を抱えている。
+`ArchiveGatewayImpl.archive()`は`TcpGateConnection.sendArchiveRequestAndAwait()`を介して`archive-complete`/`archive-rejected`（`requestId`相関、`protocol-mod-manager.md` 3.3〜3.5節）を受信するまで同期的にブロックする。この呼び出しは`CommandRegistrar.kt`の`/archive`（Brigadierコマンドディスパッチ）と`DeathCountdown.kt`の`handleBossKill()`（`LivingDeathEvent`ハンドラ）の2箇所から行われ、**どちらもサーバーのメインスレッド上**で発生する。ブロック中はTPSが停止し他コマンドも処理されない実害が`/archive`側で実機で見つかっている（`specification.md` 3.2節「`archive-rejected`の追加経緯」）。`handleBossKill()`側は現状同種のバグ報告は無いが、同じブロッキング呼び出しを経由している以上、構造的には同じ問題を抱えている。
 
 ### 方針：send-and-forget化＋コールバック
 
-`TcpGateConnection`を「送って`future.get()`で待つ」実装から、「送って登録したコールバックを応答受信時に呼ぶ」実装に変える。
+`TcpGateConnection`を「送って`future.get()`で待つ」実装から、「送って、応答（`archive-complete`/`archive-rejected`、`requestId`相関）を受信したreaderスレッドが登録済みのコールバックを直接呼ぶ」実装に変える。タイムアウトも`future.get(timeout)`ではなく、送信時に別途スケジュールし、応答到着とタイムアウト発火のどちらが先でも二重発火しないようにする（既存の「`requestId`をキーに一度だけ取り出して処理する」パターンをそのまま踏襲する）。
 
-```kotlin
-// adapter/gate/TcpGateConnection.kt
-private val pendingArchiveResponses = ConcurrentHashMap<String, (ArchiveResult) -> Unit>()
-private val timeoutScheduler = Executors.newSingleThreadScheduledExecutor { Thread(it, "hardcoretogether-archive-timeout").apply { isDaemon = true } }
+**「デッドロックの教訓」（下記「設計判断まとめ」参照）の遵守**：readerスレッドはコールバックを直接呼ぶが、コールバック自体はメインスレッドへ処理を委譲するだけで即座に返り、readerスレッド上で何かを待つことは一切しない。
 
-fun sendArchiveRequest(name: String, elapsedTime: Long, createdAt: String, onResult: (ArchiveResult) -> Unit) {
-    val requestId = UUID.randomUUID().toString()
-    pendingArchiveResponses[requestId] = onResult
-    send(JsonObject().apply {
-        addProperty("type", "archive-request")
-        addProperty("requestId", requestId)
-        addProperty("name", name)
-        addProperty("elapsedTime", elapsedTime)
-        addProperty("createdAt", createdAt)
-    })
-    timeoutScheduler.schedule(
-        { pendingArchiveResponses.remove(requestId)?.invoke(ArchiveResult.TimedOut) },
-        ARCHIVE_COMPLETE_TIMEOUT_SECONDS, TimeUnit.SECONDS,
-    )
-}
+### `ArchiveGatewayImpl`：flushもリクエスト間で直列化する
 
-// readerスレッド（handleMessage）から直接呼ばれる
-private fun handleMessage(line: String) {
-    val json = JsonParser.parseString(line).asJsonObject
-    when (json.get("type")?.asString) {
-        "archive-complete" ->
-            pendingArchiveResponses.remove(json.get("requestId").asString)?.invoke(ArchiveResult.Success)
-        "archive-rejected" ->
-            pendingArchiveResponses.remove(json.get("requestId").asString)
-                ?.invoke(ArchiveResult.Rejected(json.get("reason").asString))
-    }
-}
-```
+非同期化により、手動`/archive`の応答待ち中に自動アーカイブ（ボスキル）が割り込む、といった**複数の`archive-request`が真に並行してin-flightになる状況**が初めて現実に起こり得るようになる（同期実装ではメインスレッドが1件目の`archive-complete`待ちでブロックされている間、2件目のトリガー自体が発生しようがなかったため、これまでは構造的に起こり得なかった）。この状態で後発リクエストの`archive()`呼び出しが無条件に`save-all flush`を発行すると、**Manager側がまだ先発リクエストのワールドフォルダコピーを実行中である可能性がある**——OSレベルのファイルコピーは原子的ではないため、その最中に後発のflushでディスク上のファイルが書き換わると、先発のアーカイブが新旧混在の歪んだ状態になる。これはsave-off/save-onブラケットが本来防ぐはずだった不具合（3.2節）を、オートセーブではなく明示的な`save-all flush`という別経路から引き起こしてしまう抜けである。
 
-タイムアウトは`future.get(timeout)`が使えなくなるため、`ScheduledExecutorService`で明示的にスケジュールし、`ConcurrentHashMap.remove`が非nullを返した側だけが処理を行う（応答到着とタイムアウト発火が競合しても二重発火しない、既存の`pendingArchiveResponses.remove(requestId)?.let { ... }`パターンをそのまま踏襲）。
+そのため`save-off`だけでなく`save-all flush`自体もリクエスト間で直列化する：`ArchiveGatewayImpl`に未処理リクエストのFIFOキューを持たせ、**次のリクエストのflushは、直前のリクエストの`archive-complete`/`archive-rejected`を受信し終えるまで発行しない**（同時にManagerへ送信済み・応答待ちなのは常に高々1件）。`save-off`はキューが空→非空になった時点の1回だけ、`save-on`はキューが空に戻った時点の1回だけ発行する。この直列化により、複数件溜まっている間は後発リクエストの応答が先発より遅れる（レイテンシの犠牲）が、`archive()`自体はキューに積むだけで即座に返るためメインスレッドは一切ブロックせず、非同期化の目的（TPS停止の解消）は損なわれない。
 
-**「デッドロックの教訓」（後述「設計判断まとめ」参照）の遵守**：`handleMessage`はreaderスレッド上で`onResult`コールバックを直接呼ぶが、コールバック自体は`server.execute{}`へ処理を渡すだけで即座に返る（後述）。readerスレッドが何かを待つことは一切無いため、教訓の制約（readerスレッド上で同じ接続の別メッセージ待ちをしてはいけない）に抵触しない。
-
-### `ArchiveGateway`／`ArchiveGatewayImpl`：flushを直列化するキュー方式
-
-非同期化により、手動`/archive`の応答待ち中に自動アーカイブ（ボスキル）が割り込む、といった**複数の`archive-request`が真に並行してin-flightになる状況**が初めて現実に起こり得るようになる（同期実装ではメインスレッドが1件目の`archive-complete`待ちでブロックされている間、2件目のトリガー自体が発生しようがなかったため、これまでは構造的に起こり得なかった）。この状態で後発リクエストBの`archive()`呼び出しが無条件に`save-all flush`を発行すると、**Manager側がまだ先発リクエストAのワールドフォルダコピーを実行中である可能性がある**——OSレベルのファイルコピーは原子的ではないため、その最中にBのflushでディスク上のファイルが書き換わると、Aのアーカイブが新旧混在の歪んだ状態になる。これはsave-off/save-onブラケットが本来防ぐはずだった不具合（3.2節）を、オートセーブではなく明示的な`save-all flush`という別経路から引き起こしてしまう抜けである。
-
-そのため`save-off`だけでなく`save-all flush`自体もアーカイブ間で直列化する。`ArchiveGatewayImpl`に未処理リクエストのFIFOキューを持たせ、**次のリクエストのflushは、直前のリクエストの`archive-complete`/`archive-rejected`を受信し終えるまで発行しない**。これにより、あるリクエストのflushとManagerが実際にコピー中の別リクエストとが時間的に絶対に重ならなくなる。
-
-```kotlin
-// adapter/gate/ArchiveGatewayImpl.kt
-class ArchiveGatewayImpl(
-    private val server: MinecraftServer,
-    private val connection: TcpGateConnection,
-) : ArchiveGateway {
-    private data class QueuedArchive(val name: String, val elapsedTime: Long, val onResult: (ArchiveResult) -> Unit)
-
-    private val queue = ArrayDeque<QueuedArchive>() // メインスレッド専用。下記参照
-    private var saveOffActive = false
-    private var inFlight = false
-
-    override fun archive(name: String, elapsedTime: Long, onResult: (ArchiveResult) -> Unit) {
-        queue.addLast(QueuedArchive(name, elapsedTime, onResult))
-        if (!saveOffActive) {
-            saveOffActive = true
-            dispatch("save-off")
-        }
-        if (!inFlight) processNext()
-    }
-
-    // 常にメインスレッドから呼ばれる：archive()から直接、またはserver.execute{}経由のコールバックから
-    private fun processNext() {
-        val next = queue.removeFirstOrNull()
-        if (next == null) {
-            if (saveOffActive) {
-                saveOffActive = false
-                dispatch("save-on")
-            }
-            return
-        }
-        inFlight = true
-        dispatch("save-all flush") // 直前のリクエストの応答受信後にのみ発行される（本文参照）
-        connection.sendArchiveRequest(next.name, next.elapsedTime, Instant.now().toString()) { result ->
-            server.execute {
-                inFlight = false
-                next.onResult(result)
-                processNext() // キューに次があればそれを、無ければsave-onして終わる
-            }
-        }
-    }
-}
-```
-
-`queue`・`saveOffActive`・`inFlight`はいずれも`AtomicInteger`等の同期プリミティブを使わないただのフィールドでよい：書き換えが起きるのは①`archive()`呼び出し時（呼び出し元は`CommandRegistrar`・`DeathCountdown`のいずれもメインスレッド）と②`processNext()`内（`archive()`からの直接呼び出し、または応答コールバック内の`server.execute{}`の中＝どちらもメインスレッド）の2箇所のみで、**どちらも必ずメインスレッド上でしか実行されない**（readerスレッドはコールバックを起動するだけでこれらのフィールドには一切触れない）ため。
-
-この直列化により、キューに複数件溜まっている間は後発リクエストの応答が先発より遅れる（同時にin-flightなのは常に高々1件）が、**メインスレッドは一切ブロックしない**（`archive()`はキューに積むだけで即座に返る）ため、非同期化の本来の目的（TPS停止の解消）は損なわれない。犠牲になるのはレイテンシ（後発リクエストの`archive-complete`が遅れて届く）だけであり、これは複数のアーカイブが短時間に重なるという稀なケースでのみ発生する。
+キューの状態（未処理リクエスト・save-off中かどうか・現在in-flightかどうか）は`AtomicInteger`等の同期プリミティブを使わないただのフィールドでよい：書き換えが起きるのは①`archive()`呼び出し時（呼び出し元は`CommandRegistrar`・`DeathCountdown`のいずれもメインスレッド）と②応答コールバック内（メインスレッドへ処理を委譲した後）の2箇所のみで、どちらも必ずメインスレッド上でしか実行されない（readerスレッドはコールバックを起動するだけでこれらの状態には一切触れない）ため。
 
 ### `ArchiveService`／`ChallengeApplicationService`：コールバックの伝播
 
-```kotlin
-// application/ArchiveService.kt
-fun archiveWithGeneratedName(elapsedSeconds: Long, onResult: (ArchiveResult) -> Unit): String {
-    val name = timestampName()
-    gateway.archive(name, elapsedSeconds, onResult)
-    return name // 名前はMOD側が自前で採番するため、非同期化後も同期的に分かる
-}
-
-fun archive(name: String, elapsedSeconds: Long, onResult: (ArchiveResult) -> Unit) =
-    gateway.archive(name, elapsedSeconds, onResult)
-```
-
-```kotlin
-// application/ChallengeApplicationService.kt
-fun recordCheckpoint(trigger: Trigger, onResult: (ArchiveResult) -> Unit = {}) {
-    val name = archiveService.archiveWithGeneratedName(challengeService.elapsedSeconds(), onResult)
-    recordService.appendSave(challengeService.id, challengeService.elapsedSeconds(), name, trigger)
-}
-
-fun recordClear(trigger: Trigger, onResult: (ArchiveResult) -> Unit = {}) {
-    val name = archiveService.archiveWithGeneratedName(challengeService.elapsedSeconds(), onResult)
-    recordService.appendClear(challengeService.id, challengeService.elapsedSeconds(), trigger)
-    endChallenge()
-}
-```
-
-名前の採番（`timestampName()`）はMOD側で完結しているため引き続き同期的に返せる。`appendSave`/`appendClear`・`endChallenge()`（`running-changed: false`送信を含む）は、アーカイブ本体の完了を待たずに従来通りその場で実行する。
+`archiveWithGeneratedName`・`archive`はいずれも結果を受け取るコールバックを追加で受け取り、`ArchiveGateway`へそのまま渡す形に変える。アーカイブ名の採番はMOD側で完結しているため、非同期化後も呼び出し側へ同期的に返せる。`recordCheckpoint`/`recordClear`が行う記録（`appendSave`/`appendClear`）と`recordClear`の`endChallenge()`（`running-changed: false`送信を含む）は、アーカイブ本体の完了を待たずに従来通りその場で実行する。
 
 **順序に関する検討事項**：これにより、`running-changed: false`が`archive-complete`/`archive-rejected`より先にManagerへ届く順序が生じ得る（従来の同期実装では、アーカイブ完了＝`endChallenge()`実行だったため必ずアーカイブ完了後だった）。問題ないと判断した理由：プロトコル上`running-changed`と`archive-request`系シグナルの間に順序保証は無く、Manager側もこの2つを独立に処理する（`running`の永続化と`archive/`へのコピーは別々の関心事）。`specification.md`・`protocol-mod-manager.md`に順序依存の記述は無いため、この変更で壊れる契約は無い。
 
-### `DeathCountdown`：ボスキル経路のコールバック化
+### `DeathCountdown`／`CommandRegistrar`：呼び出し側の変更
 
-```kotlin
-// adapter/neoforge/DeathCountdown.kt
-private fun handleBossKill(mobId: String, category: BossCategory) {
-    val trigger = BossTrigger(mobId)
-    val onResult: (ArchiveResult) -> Unit = { result ->
-        when (result) {
-            is ArchiveResult.Success -> {}
-            is ArchiveResult.Rejected ->
-                HardcoreTogether.LOGGER.error("Boss-kill archive for '$mobId' was rejected: ${result.reason}; continuing anyway")
-            is ArchiveResult.TimedOut ->
-                HardcoreTogether.LOGGER.error("Boss-kill archive for '$mobId' did not complete in time; continuing anyway")
-        }
-    }
-    when (category) {
-        BossCategory.CHECKPOINT -> applicationService.recordCheckpoint(trigger, onResult)
-        BossCategory.CLEAR -> applicationService.recordClear(trigger, onResult)
-        BossCategory.NONE -> return
-    }
-}
-```
+`DeathCountdown.handleBossKill()`は結果コールバックの中でログ出力するだけに変わる（従来通り記録は結果によらず必ず行う）。
 
-### `CommandRegistrar`：`/archive`の即時応答化
+`CommandRegistrar`の`/archive`は、コマンド実行直後に「アーカイブ処理を開始しました」という受理メッセージを即座に返し、実際の成否（`保存完了`／拒否理由／タイムアウト）は結果コールバックが呼ばれた時点で別途OPへ通知する形に変える。コールバックはコマンド実行から数tick遅れて呼ばれるため、`CommandSourceStack`をその間保持することになるが、`sendSuccess`/`sendFailure`はその時点で送信先が有効である限り安全に呼べる（既存コードも送信者が`ServerPlayer`かどうかをnull許容に扱っている）。**手動`/archive`の記録タイミングは変更しない**：`recordService.appendSave`は従来通りアーカイブ成功時のみ呼ぶ（自動アーカイブ側の「記録は結果によらず必ず行う」という非対称な既存仕様とは意図的に揃えていない、`application`層の項参照）。
 
-```kotlin
-// adapter/neoforge/CommandRegistrar.kt
-private fun archive(source: CommandSourceStack, name: String): Int {
-    val runtime = HardcoreTogether.runtime ?: run {
-        source.sendFailure(Component.literal("サーバーがまだ起動していません"))
-        return 0
-    }
-    val elapsed = runtime.challengeService.elapsedSeconds()
-    val triggerPlayer = (source.entity as? ServerPlayer)?.stringUUID ?: "console"
-
-    runtime.archiveService.archive(name, elapsed) { result ->
-        when (result) {
-            is ArchiveResult.Success -> {
-                runtime.recordService.appendSave(runtime.challengeService.id, elapsed, name, ManualTrigger(triggerPlayer))
-                source.sendSuccess({ Component.literal("保存完了: $name") }, true)
-            }
-            is ArchiveResult.Rejected ->
-                source.sendFailure(Component.literal("アーカイブに失敗しました: ${result.reason}"))
-            is ArchiveResult.TimedOut ->
-                source.sendFailure(Component.literal("アーカイブに失敗しました（Gateからの応答がタイムアウトしました）: $name"))
-        }
-    }
-    source.sendSuccess({ Component.literal("アーカイブ処理を開始しました: $name") }, false)
-    return 1
-}
-```
-
-`source`（`CommandSourceStack`）はコマンド実行時点のスナップショットをコールバック実行時（数tick後）まで保持することになるが、`sendSuccess`/`sendFailure`はその時点で送信先が有効である限り安全に呼べる（既存コードも`source.entity as? ServerPlayer`でnull許容に扱っている）。**手動`/archive`の記録タイミングは変更しない**：`recordService.appendSave`は従来通り`ArchiveResult.Success`の場合のみ呼ぶ（自動アーカイブ側の「記録は結果によらず必ず行う」という非対称な既存仕様とは意図的に揃えていない、`application`層の項参照）。
-
-手動`/archive`実行中に自動アーカイブ（ボスキル）が割り込む、といったケースを`/archive`コマンド自体が拒否する必要は無い：上記`ArchiveGatewayImpl`のキューが自動的に後発リクエストを積んで直列化するため、MOD側で追加の排他制御を持つ理由が無い（`requestId`は各リクエストの応答相関のために引き続き必要——キュー内で待たされている間に別の接続断・再接続等が起きても取り違えないようにするため）。Manager側は`opMutex`を別途持つ（`architecture-manager.md`参照）が、これはMOD側のキューと独立な、Manager自身の内部状態を守るための排他制御である。
+手動`/archive`実行中に自動アーカイブが割り込む、といったケースを`/archive`コマンド自体が拒否する必要は無い：`ArchiveGatewayImpl`のキューが自動的に後発リクエストを積んで直列化するため、MOD側で追加の排他制御を持つ理由が無い（`requestId`は各リクエストの応答相関のために引き続き必要）。Manager側は`opMutex`を別途持つ（`architecture-manager.md`参照）が、これはMOD側のキューと独立な、Manager自身の内部状態を守るための排他制御である。
 
 ### 未決事項
 
-- `timeoutScheduler`（`ScheduledExecutorService`）のシャットダウンタイミング：サーバー停止時に明示的に`shutdown()`するかは未確定。デーモンスレッドなのでプロセス終了時には残らないが、`/deactivate`を挟まないサーバー再起動を1プロセス内で繰り返すような使い方（現状想定されていない）をする場合はリークしうる
+- タイムアウト検出に使うスケジューラのシャットダウンタイミング：サーバー停止時に明示的に止めるかは未確定。デーモンスレッドで運用する想定のためプロセス終了時には残らないが、`/deactivate`を挟まないサーバー再起動を1プロセス内で繰り返すような使い方（現状想定されていない）をする場合はリークしうる
 
 ## 設計判断まとめ
 
