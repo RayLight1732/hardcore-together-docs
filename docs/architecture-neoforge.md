@@ -395,11 +395,11 @@ private fun handleMessage(line: String) {
 
 **「デッドロックの教訓」（後述「設計判断まとめ」参照）の遵守**：`handleMessage`はreaderスレッド上で`onResult`コールバックを直接呼ぶが、コールバック自体は`server.execute{}`へ処理を渡すだけで即座に返る（後述）。readerスレッドが何かを待つことは一切無いため、教訓の制約（readerスレッド上で同じ接続の別メッセージ待ちをしてはいけない）に抵触しない。
 
-### `ArchiveGateway`／`ArchiveGatewayImpl`：save-off/save-onの参照カウント化
+### `ArchiveGateway`／`ArchiveGatewayImpl`：flushを直列化するキュー方式
 
-`archive()`をfire-and-forgetにする際、素朴に「呼び出しごとにsave-off→…→save-on」を対で行うと**新しい不具合を生む**：非同期化により、手動`/archive`のレスポンス待ち中に自動アーカイブ（ボスキル）が割り込む、といった**複数の`archive-request`が真に並行してin-flightになる状況**が初めて現実に起こり得るようになる（同期実装ではメインスレッドが1件目の`archive-complete`待ちでブロックされている間、2件目のトリガー自体（ボスキルのtick処理）が発生しようがなかったため、これまでは構造的に起こり得なかった）。この状態で先に完了した側が単純に`save-on`を叩くと、まだコピー中の後発リクエストのオートセーブを再開してしまい、`save-off`/`save-on`ブラケットを導入した本来の目的（3.2節「コピー中に次のオートセーブが走ると歪んだアーカイブができるリスク」）に逆行する。
+非同期化により、手動`/archive`の応答待ち中に自動アーカイブ（ボスキル）が割り込む、といった**複数の`archive-request`が真に並行してin-flightになる状況**が初めて現実に起こり得るようになる（同期実装ではメインスレッドが1件目の`archive-complete`待ちでブロックされている間、2件目のトリガー自体が発生しようがなかったため、これまでは構造的に起こり得なかった）。この状態で後発リクエストBの`archive()`呼び出しが無条件に`save-all flush`を発行すると、**Manager側がまだ先発リクエストAのワールドフォルダコピーを実行中である可能性がある**——OSレベルのファイルコピーは原子的ではないため、その最中にBのflushでディスク上のファイルが書き換わると、Aのアーカイブが新旧混在の歪んだ状態になる。これはsave-off/save-onブラケットが本来防ぐはずだった不具合（3.2節）を、オートセーブではなく明示的な`save-all flush`という別経路から引き起こしてしまう抜けである。
 
-対策として、`ArchiveGatewayImpl`にin-flight件数を持たせ、0→1で`save-off`、1→0で`save-on`を実行する（参照カウント方式）。
+そのため`save-off`だけでなく`save-all flush`自体もアーカイブ間で直列化する。`ArchiveGatewayImpl`に未処理リクエストのFIFOキューを持たせ、**次のリクエストのflushは、直前のリクエストの`archive-complete`/`archive-rejected`を受信し終えるまで発行しない**。これにより、あるリクエストのflushとManagerが実際にコピー中の別リクエストとが時間的に絶対に重ならなくなる。
 
 ```kotlin
 // adapter/gate/ArchiveGatewayImpl.kt
@@ -407,24 +407,47 @@ class ArchiveGatewayImpl(
     private val server: MinecraftServer,
     private val connection: TcpGateConnection,
 ) : ArchiveGateway {
-    private var inFlightArchives = 0 // メインスレッド専用。下記参照
+    private data class QueuedArchive(val name: String, val elapsedTime: Long, val onResult: (ArchiveResult) -> Unit)
+
+    private val queue = ArrayDeque<QueuedArchive>() // メインスレッド専用。下記参照
+    private var saveOffActive = false
+    private var inFlight = false
 
     override fun archive(name: String, elapsedTime: Long, onResult: (ArchiveResult) -> Unit) {
-        if (inFlightArchives++ == 0) dispatch("save-off")
-        dispatch("save-all flush") // 各archive-requestの直前で毎回必要（プロトコル上の前提、6節）
-        connection.sendArchiveRequest(name, elapsedTime, Instant.now().toString()) { result ->
+        queue.addLast(QueuedArchive(name, elapsedTime, onResult))
+        if (!saveOffActive) {
+            saveOffActive = true
+            dispatch("save-off")
+        }
+        if (!inFlight) processNext()
+    }
+
+    // 常にメインスレッドから呼ばれる：archive()から直接、またはserver.execute{}経由のコールバックから
+    private fun processNext() {
+        val next = queue.removeFirstOrNull()
+        if (next == null) {
+            if (saveOffActive) {
+                saveOffActive = false
+                dispatch("save-on")
+            }
+            return
+        }
+        inFlight = true
+        dispatch("save-all flush") // 直前のリクエストの応答受信後にのみ発行される（本文参照）
+        connection.sendArchiveRequest(next.name, next.elapsedTime, Instant.now().toString()) { result ->
             server.execute {
-                if (--inFlightArchives == 0) dispatch("save-on")
-                onResult(result)
+                inFlight = false
+                next.onResult(result)
+                processNext() // キューに次があればそれを、無ければsave-onして終わる
             }
         }
     }
 }
 ```
 
-`inFlightArchives`は`AtomicInteger`等の同期プリミティブを使わないただの`var`でよい：書き換えが起きるのは①`archive()`呼び出し時のインクリメント（呼び出し元は`CommandRegistrar`・`DeathCountdown`のいずれもメインスレッド）と②応答コールバック内のデクリメント（`server.execute{}`の中＝これもメインスレッド）の2箇所のみで、**どちらも必ずメインスレッド上でしか実行されない**（readerスレッドはコールバックを起動するだけで`inFlightArchives`には一切触れない）ため。
+`queue`・`saveOffActive`・`inFlight`はいずれも`AtomicInteger`等の同期プリミティブを使わないただのフィールドでよい：書き換えが起きるのは①`archive()`呼び出し時（呼び出し元は`CommandRegistrar`・`DeathCountdown`のいずれもメインスレッド）と②`processNext()`内（`archive()`からの直接呼び出し、または応答コールバック内の`server.execute{}`の中＝どちらもメインスレッド）の2箇所のみで、**どちらも必ずメインスレッド上でしか実行されない**（readerスレッドはコールバックを起動するだけでこれらのフィールドには一切触れない）ため。
 
-`save-all flush`は参照カウントに関わらず`archive()`が呼ばれるたびに毎回実行する：各`archive-request`が捉えるべきスナップショットはリクエストごとに異なるため、`save-off`は「以後のオートセーブを止める」役割（1回でよい）だが、`flush`は「今の状態をディスクに書き出す」役割（リクエストごとに必要）という別の関心事だから。
+この直列化により、キューに複数件溜まっている間は後発リクエストの応答が先発より遅れる（同時にin-flightなのは常に高々1件）が、**メインスレッドは一切ブロックしない**（`archive()`はキューに積むだけで即座に返る）ため、非同期化の本来の目的（TPS停止の解消）は損なわれない。犠牲になるのはレイテンシ（後発リクエストの`archive-complete`が遅れて届く）だけであり、これは複数のアーカイブが短時間に重なるという稀なケースでのみ発生する。
 
 ### `ArchiveService`／`ChallengeApplicationService`：コールバックの伝播
 
@@ -512,7 +535,7 @@ private fun archive(source: CommandSourceStack, name: String): Int {
 
 `source`（`CommandSourceStack`）はコマンド実行時点のスナップショットをコールバック実行時（数tick後）まで保持することになるが、`sendSuccess`/`sendFailure`はその時点で送信先が有効である限り安全に呼べる（既存コードも`source.entity as? ServerPlayer`でnull許容に扱っている）。**手動`/archive`の記録タイミングは変更しない**：`recordService.appendSave`は従来通り`ArchiveResult.Success`の場合のみ呼ぶ（自動アーカイブ側の「記録は結果によらず必ず行う」という非対称な既存仕様とは意図的に揃えていない、`application`層の項参照）。
 
-複数の`archive-request`が並行してin-flightな状況（手動`/archive`実行中に自動アーカイブが割り込む等）を`/archive`コマンド自体が拒否する必要は無い：`requestId`により応答の相関は保証され、`save-off`/`save-on`は上記の参照カウントで安全に保たれるため、MOD側で追加の排他制御を持つ理由が無い（Manager側は`opMutex`を別途持つ、`architecture-manager.md`参照）。
+手動`/archive`実行中に自動アーカイブ（ボスキル）が割り込む、といったケースを`/archive`コマンド自体が拒否する必要は無い：上記`ArchiveGatewayImpl`のキューが自動的に後発リクエストを積んで直列化するため、MOD側で追加の排他制御を持つ理由が無い（`requestId`は各リクエストの応答相関のために引き続き必要——キュー内で待たされている間に別の接続断・再接続等が起きても取り違えないようにするため）。Manager側は`opMutex`を別途持つ（`architecture-manager.md`参照）が、これはMOD側のキューと独立な、Manager自身の内部状態を守るための排他制御である。
 
 ### 未決事項
 
@@ -538,4 +561,4 @@ private fun archive(source: CommandSourceStack, name: String): Int {
 
 ## 未着手・既知の課題
 
-- 【設計済み・実装未反映】`CommandRegistrar.kt`の`/archive`実装がサーバーのメインスレッドで`archive-complete`受信まで同期的にブロックする点（`TcpGateConnection.sendArchiveRequestAndAwait`の`future.get(60, SECONDS)`）を、send-and-forget＋コールバック方式へ非同期化する設計を確定した（本ページ「`/archive`アーカイブ経路の非同期化」節）。あわせて、`DeathCountdown.kt`の自動アーカイブ（ボスキル）経路も同じ`ArchiveGateway.archive()`を経由するため同時に非同期化する。実装時の要点：①readerスレッドから直接コールバックを呼ぶが、コールバックは`server.execute{}`へ委譲するだけに留め「デッドロックの教訓」に抵触しないこと、②`ArchiveGatewayImpl`のsave-off/save-onを参照カウント化し、複数の`archive-request`が並行してin-flightな状態でも早期の`save-on`でオートセーブを再開してしまわないようにすること
+- 【設計済み・実装未反映】`CommandRegistrar.kt`の`/archive`実装がサーバーのメインスレッドで`archive-complete`受信まで同期的にブロックする点（`TcpGateConnection.sendArchiveRequestAndAwait`の`future.get(60, SECONDS)`）を、send-and-forget＋コールバック方式へ非同期化する設計を確定した（本ページ「`/archive`アーカイブ経路の非同期化」節）。あわせて、`DeathCountdown.kt`の自動アーカイブ（ボスキル）経路も同じ`ArchiveGateway.archive()`を経由するため同時に非同期化する。実装時の要点：①readerスレッドから直接コールバックを呼ぶが、コールバックは`server.execute{}`へ委譲するだけに留め「デッドロックの教訓」に抵触しないこと、②`ArchiveGatewayImpl`にFIFOキューを持たせ、`save-off`だけでなく`save-all flush`自体もリクエスト間で直列化すること（先発の`archive-request`をManagerがまだコピー中の可能性がある間に後発が無条件で`save-all flush`を発行すると、それだけで歪んだアーカイブを作りうるため）
