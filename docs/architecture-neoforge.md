@@ -342,6 +342,182 @@ class FileRecordRepository(private val dir: Path) : RecordRepository
 
 「クラス名を保存しリフレクションで復元」ではなく「`kind`文字列＋汎用フィールド」という読み取りモデルの設計判断自体は無駄にならない：Gate（Go実装）が`records/*.json`を読む際も、`kind`フィールドが将来のリファクタリング・MOD削除に対して安定した識別子であるという性質はそのまま活きる。単にその読み取りロジックの実装言語・実行プロセスがhardcoretogether（Kotlin）からGate（Go）に移っただけである。
 
+## `/archive`アーカイブ経路の非同期化【設計済み・実装未反映】
+
+### 問題
+
+`ArchiveGatewayImpl.archive()`は`TcpGateConnection.sendArchiveRequestAndAwait()`を介して`archive-complete`/`archive-rejected`（`requestId`相関、`protocol-mod-manager.md` 3.3〜3.5節）を受信するまで同期的にブロックする。この呼び出しは2箇所から行われ、**どちらもサーバーのメインスレッド上**で発生する：
+
+- `CommandRegistrar.kt`の`/archive`（Brigadierコマンドディスパッチ＝メインスレッド）
+- `DeathCountdown.kt`の`handleBossKill()`（`LivingDeathEvent`ハンドラ＝メインスレッド）
+
+ブロック中はTPSが停止し他コマンドも処理されない実害が`/archive`側で実機で見つかっている（`specification.md` 3.2節「`archive-rejected`の追加経緯」）。`handleBossKill()`側は現状同種のバグ報告は無いが、`ArchiveGateway.archive()`という同じブロッキング呼び出しを経由している以上、構造的には同じ問題を抱えている。
+
+### 方針：send-and-forget化＋コールバック
+
+`TcpGateConnection`を「送って`future.get()`で待つ」実装から、「送って登録したコールバックを応答受信時に呼ぶ」実装に変える。
+
+```kotlin
+// adapter/gate/TcpGateConnection.kt
+private val pendingArchiveResponses = ConcurrentHashMap<String, (ArchiveResult) -> Unit>()
+private val timeoutScheduler = Executors.newSingleThreadScheduledExecutor { Thread(it, "hardcoretogether-archive-timeout").apply { isDaemon = true } }
+
+fun sendArchiveRequest(name: String, elapsedTime: Long, createdAt: String, onResult: (ArchiveResult) -> Unit) {
+    val requestId = UUID.randomUUID().toString()
+    pendingArchiveResponses[requestId] = onResult
+    send(JsonObject().apply {
+        addProperty("type", "archive-request")
+        addProperty("requestId", requestId)
+        addProperty("name", name)
+        addProperty("elapsedTime", elapsedTime)
+        addProperty("createdAt", createdAt)
+    })
+    timeoutScheduler.schedule(
+        { pendingArchiveResponses.remove(requestId)?.invoke(ArchiveResult.TimedOut) },
+        ARCHIVE_COMPLETE_TIMEOUT_SECONDS, TimeUnit.SECONDS,
+    )
+}
+
+// readerスレッド（handleMessage）から直接呼ばれる
+private fun handleMessage(line: String) {
+    val json = JsonParser.parseString(line).asJsonObject
+    when (json.get("type")?.asString) {
+        "archive-complete" ->
+            pendingArchiveResponses.remove(json.get("requestId").asString)?.invoke(ArchiveResult.Success)
+        "archive-rejected" ->
+            pendingArchiveResponses.remove(json.get("requestId").asString)
+                ?.invoke(ArchiveResult.Rejected(json.get("reason").asString))
+    }
+}
+```
+
+タイムアウトは`future.get(timeout)`が使えなくなるため、`ScheduledExecutorService`で明示的にスケジュールし、`ConcurrentHashMap.remove`が非nullを返した側だけが処理を行う（応答到着とタイムアウト発火が競合しても二重発火しない、既存の`pendingArchiveResponses.remove(requestId)?.let { ... }`パターンをそのまま踏襲）。
+
+**「デッドロックの教訓」（後述「設計判断まとめ」参照）の遵守**：`handleMessage`はreaderスレッド上で`onResult`コールバックを直接呼ぶが、コールバック自体は`server.execute{}`へ処理を渡すだけで即座に返る（後述）。readerスレッドが何かを待つことは一切無いため、教訓の制約（readerスレッド上で同じ接続の別メッセージ待ちをしてはいけない）に抵触しない。
+
+### `ArchiveGateway`／`ArchiveGatewayImpl`：save-off/save-onの参照カウント化
+
+`archive()`をfire-and-forgetにする際、素朴に「呼び出しごとにsave-off→…→save-on」を対で行うと**新しい不具合を生む**：非同期化により、手動`/archive`のレスポンス待ち中に自動アーカイブ（ボスキル）が割り込む、といった**複数の`archive-request`が真に並行してin-flightになる状況**が初めて現実に起こり得るようになる（同期実装ではメインスレッドが1件目の`archive-complete`待ちでブロックされている間、2件目のトリガー自体（ボスキルのtick処理）が発生しようがなかったため、これまでは構造的に起こり得なかった）。この状態で先に完了した側が単純に`save-on`を叩くと、まだコピー中の後発リクエストのオートセーブを再開してしまい、`save-off`/`save-on`ブラケットを導入した本来の目的（3.2節「コピー中に次のオートセーブが走ると歪んだアーカイブができるリスク」）に逆行する。
+
+対策として、`ArchiveGatewayImpl`にin-flight件数を持たせ、0→1で`save-off`、1→0で`save-on`を実行する（参照カウント方式）。
+
+```kotlin
+// adapter/gate/ArchiveGatewayImpl.kt
+class ArchiveGatewayImpl(
+    private val server: MinecraftServer,
+    private val connection: TcpGateConnection,
+) : ArchiveGateway {
+    private var inFlightArchives = 0 // メインスレッド専用。下記参照
+
+    override fun archive(name: String, elapsedTime: Long, onResult: (ArchiveResult) -> Unit) {
+        if (inFlightArchives++ == 0) dispatch("save-off")
+        dispatch("save-all flush") // 各archive-requestの直前で毎回必要（プロトコル上の前提、6節）
+        connection.sendArchiveRequest(name, elapsedTime, Instant.now().toString()) { result ->
+            server.execute {
+                if (--inFlightArchives == 0) dispatch("save-on")
+                onResult(result)
+            }
+        }
+    }
+}
+```
+
+`inFlightArchives`は`AtomicInteger`等の同期プリミティブを使わないただの`var`でよい：書き換えが起きるのは①`archive()`呼び出し時のインクリメント（呼び出し元は`CommandRegistrar`・`DeathCountdown`のいずれもメインスレッド）と②応答コールバック内のデクリメント（`server.execute{}`の中＝これもメインスレッド）の2箇所のみで、**どちらも必ずメインスレッド上でしか実行されない**（readerスレッドはコールバックを起動するだけで`inFlightArchives`には一切触れない）ため。
+
+`save-all flush`は参照カウントに関わらず`archive()`が呼ばれるたびに毎回実行する：各`archive-request`が捉えるべきスナップショットはリクエストごとに異なるため、`save-off`は「以後のオートセーブを止める」役割（1回でよい）だが、`flush`は「今の状態をディスクに書き出す」役割（リクエストごとに必要）という別の関心事だから。
+
+### `ArchiveService`／`ChallengeApplicationService`：コールバックの伝播
+
+```kotlin
+// application/ArchiveService.kt
+fun archiveWithGeneratedName(elapsedSeconds: Long, onResult: (ArchiveResult) -> Unit): String {
+    val name = timestampName()
+    gateway.archive(name, elapsedSeconds, onResult)
+    return name // 名前はMOD側が自前で採番するため、非同期化後も同期的に分かる
+}
+
+fun archive(name: String, elapsedSeconds: Long, onResult: (ArchiveResult) -> Unit) =
+    gateway.archive(name, elapsedSeconds, onResult)
+```
+
+```kotlin
+// application/ChallengeApplicationService.kt
+fun recordCheckpoint(trigger: Trigger, onResult: (ArchiveResult) -> Unit = {}) {
+    val name = archiveService.archiveWithGeneratedName(challengeService.elapsedSeconds(), onResult)
+    recordService.appendSave(challengeService.id, challengeService.elapsedSeconds(), name, trigger)
+}
+
+fun recordClear(trigger: Trigger, onResult: (ArchiveResult) -> Unit = {}) {
+    val name = archiveService.archiveWithGeneratedName(challengeService.elapsedSeconds(), onResult)
+    recordService.appendClear(challengeService.id, challengeService.elapsedSeconds(), trigger)
+    endChallenge()
+}
+```
+
+名前の採番（`timestampName()`）はMOD側で完結しているため引き続き同期的に返せる。`appendSave`/`appendClear`・`endChallenge()`（`running-changed: false`送信を含む）は、アーカイブ本体の完了を待たずに従来通りその場で実行する。
+
+**順序に関する検討事項**：これにより、`running-changed: false`が`archive-complete`/`archive-rejected`より先にManagerへ届く順序が生じ得る（従来の同期実装では、アーカイブ完了＝`endChallenge()`実行だったため必ずアーカイブ完了後だった）。問題ないと判断した理由：プロトコル上`running-changed`と`archive-request`系シグナルの間に順序保証は無く、Manager側もこの2つを独立に処理する（`running`の永続化と`archive/`へのコピーは別々の関心事）。`specification.md`・`protocol-mod-manager.md`に順序依存の記述は無いため、この変更で壊れる契約は無い。
+
+### `DeathCountdown`：ボスキル経路のコールバック化
+
+```kotlin
+// adapter/neoforge/DeathCountdown.kt
+private fun handleBossKill(mobId: String, category: BossCategory) {
+    val trigger = BossTrigger(mobId)
+    val onResult: (ArchiveResult) -> Unit = { result ->
+        when (result) {
+            is ArchiveResult.Success -> {}
+            is ArchiveResult.Rejected ->
+                HardcoreTogether.LOGGER.error("Boss-kill archive for '$mobId' was rejected: ${result.reason}; continuing anyway")
+            is ArchiveResult.TimedOut ->
+                HardcoreTogether.LOGGER.error("Boss-kill archive for '$mobId' did not complete in time; continuing anyway")
+        }
+    }
+    when (category) {
+        BossCategory.CHECKPOINT -> applicationService.recordCheckpoint(trigger, onResult)
+        BossCategory.CLEAR -> applicationService.recordClear(trigger, onResult)
+        BossCategory.NONE -> return
+    }
+}
+```
+
+### `CommandRegistrar`：`/archive`の即時応答化
+
+```kotlin
+// adapter/neoforge/CommandRegistrar.kt
+private fun archive(source: CommandSourceStack, name: String): Int {
+    val runtime = HardcoreTogether.runtime ?: run {
+        source.sendFailure(Component.literal("サーバーがまだ起動していません"))
+        return 0
+    }
+    val elapsed = runtime.challengeService.elapsedSeconds()
+    val triggerPlayer = (source.entity as? ServerPlayer)?.stringUUID ?: "console"
+
+    runtime.archiveService.archive(name, elapsed) { result ->
+        when (result) {
+            is ArchiveResult.Success -> {
+                runtime.recordService.appendSave(runtime.challengeService.id, elapsed, name, ManualTrigger(triggerPlayer))
+                source.sendSuccess({ Component.literal("保存完了: $name") }, true)
+            }
+            is ArchiveResult.Rejected ->
+                source.sendFailure(Component.literal("アーカイブに失敗しました: ${result.reason}"))
+            is ArchiveResult.TimedOut ->
+                source.sendFailure(Component.literal("アーカイブに失敗しました（Gateからの応答がタイムアウトしました）: $name"))
+        }
+    }
+    source.sendSuccess({ Component.literal("アーカイブ処理を開始しました: $name") }, false)
+    return 1
+}
+```
+
+`source`（`CommandSourceStack`）はコマンド実行時点のスナップショットをコールバック実行時（数tick後）まで保持することになるが、`sendSuccess`/`sendFailure`はその時点で送信先が有効である限り安全に呼べる（既存コードも`source.entity as? ServerPlayer`でnull許容に扱っている）。**手動`/archive`の記録タイミングは変更しない**：`recordService.appendSave`は従来通り`ArchiveResult.Success`の場合のみ呼ぶ（自動アーカイブ側の「記録は結果によらず必ず行う」という非対称な既存仕様とは意図的に揃えていない、`application`層の項参照）。
+
+複数の`archive-request`が並行してin-flightな状況（手動`/archive`実行中に自動アーカイブが割り込む等）を`/archive`コマンド自体が拒否する必要は無い：`requestId`により応答の相関は保証され、`save-off`/`save-on`は上記の参照カウントで安全に保たれるため、MOD側で追加の排他制御を持つ理由が無い（Manager側は`opMutex`を別途持つ、`architecture-manager.md`参照）。
+
+### 未決事項
+
+- `timeoutScheduler`（`ScheduledExecutorService`）のシャットダウンタイミング：サーバー停止時に明示的に`shutdown()`するかは未確定。デーモンスレッドなのでプロセス終了時には残らないが、`/deactivate`を挟まないサーバー再起動を1プロセス内で繰り返すような使い方（現状想定されていない）をする場合はリークしうる
+
 ## 設計判断まとめ
 
 - レイヤー構成：domain / application / port / adapterの4層。判断ロジックを1クラスに集約せず、`ChallengeService`/`ArchiveService`/`RecordService`＋薄い`ChallengeApplicationService`に分割。真のdomain（Challenge/Trigger/RecordEvent/BossCategory）はportに一切依存しない
@@ -362,4 +538,4 @@ class FileRecordRepository(private val dir: Path) : RecordRepository
 
 ## 未着手・既知の課題
 
-- `CommandRegistrar.kt`の`/archive`実装がサーバーのメインスレッドで`archive-complete`受信まで同期的にブロックする点（`TcpGateConnection.sendArchiveRequestAndAwait`の`future.get(60, SECONDS)`）も、`requestId`導入を機に非同期化（コマンドを即座に返し、`archive-complete`/`archive-rejected`受信時に`server.execute{}`でメインスレッドへ戻して`CommandSourceStack`経由でOPへ結果を通知する設計）することが望ましいと判断したが、設計・実装ともに未着手。実装時は355行目の「デッドロックの教訓」（Gate接続のreaderスレッド自身の上で、同じ接続の別メッセージを待つ処理をしてはいけない）を踏まえ、応答受信のコールバックは必ず`server.execute{}`でメインスレッドに戻してから`CommandSourceStack`を操作すること
+- 【設計済み・実装未反映】`CommandRegistrar.kt`の`/archive`実装がサーバーのメインスレッドで`archive-complete`受信まで同期的にブロックする点（`TcpGateConnection.sendArchiveRequestAndAwait`の`future.get(60, SECONDS)`）を、send-and-forget＋コールバック方式へ非同期化する設計を確定した（本ページ「`/archive`アーカイブ経路の非同期化」節）。あわせて、`DeathCountdown.kt`の自動アーカイブ（ボスキル）経路も同じ`ArchiveGateway.archive()`を経由するため同時に非同期化する。実装時の要点：①readerスレッドから直接コールバックを呼ぶが、コールバックは`server.execute{}`へ委譲するだけに留め「デッドロックの教訓」に抵触しないこと、②`ArchiveGatewayImpl`のsave-off/save-onを参照カウント化し、複数の`archive-request`が並行してin-flightな状態でも早期の`save-on`でオートセーブを再開してしまわないようにすること
